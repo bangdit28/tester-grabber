@@ -1,4 +1,5 @@
 import threading, time, os, re, random, requests
+from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_req
 
 # === CONFIG ===
@@ -8,108 +9,151 @@ TELE_CHAT_ID = os.getenv("TELE_CHAT_ID", "").strip()
 MNIT_COOKIE = os.getenv("MNIT_COOKIE", "").strip()
 MNIT_TOKEN = os.getenv("MNIT_TOKEN", "").strip()
 MY_UA = os.getenv("MY_UA", "").strip()
+MY_COOKIE = os.getenv("MY_COOKIE", "").strip()
 
-def kirim_tele(pesan):
-    if not TELE_TOKEN or not TELE_CHAT_ID: return
+def send_or_edit_tele(text, msg_id=None):
+    """Kirim pesan baru atau edit pesan lama (biar rapi)"""
+    if not TELE_TOKEN or not TELE_CHAT_ID: return None
     try:
-        url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
-        requests.post(url, data={'chat_id': TELE_CHAT_ID, 'text': pesan, 'parse_mode': 'HTML'}, timeout=10)
-    except: pass
+        if msg_id:
+            url = f"https://api.telegram.org/bot{TELE_TOKEN}/editMessageText"
+            data = {'chat_id': TELE_CHAT_ID, 'message_id': msg_id, 'text': text, 'parse_mode': 'HTML'}
+        else:
+            url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+            data = {'chat_id': TELE_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
+        res = requests.post(url, data=data, timeout=10).json()
+        return res.get('result', {}).get('message_id')
+    except: return None
 
+# ==========================================
+# 1. MANAGER: PROSES AMBIL NOMOR
+# ==========================================
 def run_manager():
-    print(f"🛰️ MANAGER STANDBY. DATABASE: {FIREBASE_URL}")
+    print("🚀 Manager Running: Multi-Panel Active...")
     while True:
         try:
-            # 1. Ambil Antrian Perintah
             r = requests.get(f"{FIREBASE_URL}/perintah_bot.json")
             cmds = r.json()
             if not cmds or not isinstance(cmds, dict):
                 time.sleep(1); continue
             
-            # 2. Ambil Inventory
             inv = requests.get(f"{FIREBASE_URL}/inventory.json").json()
-            
             for cmd_id, val in cmds.items():
-                if not isinstance(val, dict):
-                    requests.delete(f"{FIREBASE_URL}/perintah_bot/{cmd_id}.json")
-                    continue
-                
                 m_id = val.get('memberId', 'Unknown')
-                m_name = val.get('memberName') or m_id
+                m_name = val.get('memberName', 'Admin')
                 inv_id = val.get('inventoryId')
                 
-                print(f"📥 REQUEST: {m_name} minta stok {inv_id}")
-
-                if not inv or inv_id not in inv:
+                item = inv.get(inv_id) if inv else None
+                if not item:
                     requests.delete(f"{FIREBASE_URL}/perintah_bot/{cmd_id}.json")
                     continue
-                
-                item = inv[inv_id]
+
                 nomor_hasil = None
+                situs = "CallTime" if item.get('type') != 'PREFIX' else "x.mnitnetwork"
                 
-                # AMBIL NAMA LAYANAN (Cek semua kemungkinan field name)
-                nama_layanan = item.get('serviceName') or item.get('name') or item.get('nama') or "Layanan"
-
-                # --- STRATEGI 1: CEK APAKAH ADA STOK MANUAL? ---
-                # (Bot bakal nyari di folder 'stock' atau 'stok' atau 'numbers')
-                stok_manual = item.get('stock') or item.get('stok') or item.get('numbers')
+                # --- LOGIKA AMBIL NOMOR ---
+                if item.get('type') == 'manual' or item.get('type') == 'STOCK':
+                    nums = item.get('stock') or []
+                    if nums:
+                        if isinstance(nums, list):
+                            nomor_hasil = nums.pop(0)
+                            requests.put(f"{FIREBASE_URL}/inventory/{inv_id}/stock.json", json=nums)
+                        else:
+                            key = list(nums.keys())[0]; nomor_hasil = nums[key]
+                            requests.delete(f"{FIREBASE_URL}/inventory/{inv_id}/stock/{key}.json")
                 
-                if stok_manual:
-                    if isinstance(stok_manual, list) and len(stok_manual) > 0:
-                        nomor_hasil = stok_manual.pop(0)
-                        # Update sisa stok ke Firebase (Pake field aslinya)
-                        field_name = 'stock' if item.get('stock') else ('stok' if item.get('stok') else 'numbers')
-                        requests.put(f"{FIREBASE_URL}/inventory/{inv_id}/{field_name}.json", json=stok_manual)
-                    elif isinstance(stok_manual, dict) and len(stok_manual) > 0:
-                        key = list(stok_manual.keys())[0]
-                        nomor_hasil = stok_manual[key]
-                        field_name = 'stock' if item.get('stock') else ('stok' if item.get('stok') else 'numbers')
-                        requests.delete(f"{FIREBASE_URL}/inventory/{inv_id}/{field_name}/{key}.json")
+                elif item.get('type') == 'PREFIX':
+                    # FIX: Jangan hapus XXXX, kirim mentah-mentah sesuai permintaan MNIT
+                    target_range = item.get('prefixes') or "2367261XXXX"
+                    h = {'content-type':'application/json','cookie':MNIT_COOKIE,'mauthtoken':MNIT_TOKEN,'user-agent':MY_UA}
+                    res = curl_req.post("https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/number", headers=h, json={"range":target_range}, impersonate="chrome", timeout=20)
+                    if res.status_code == 200:
+                        nomor_hasil = res.json().get('data', {}).get('copy')
 
-                # --- STRATEGI 2: JIKA STOK MANUAL KOSONG, CEK APAKAH ADA PREFIX X-MNIT? ---
-                if not nomor_hasil:
-                    raw_prefix = item.get('prefixes') or item.get('prefix')
-                    if raw_prefix:
-                        # Bersihkan XXXX biar jadi angka murni
-                        target_range = re.sub(r'[xX]', '', str(raw_prefix)).strip()
-                        print(f"🎯 Mencoba X-MNIT dengan Prefix: {target_range}")
-                        
-                        h = {'content-type':'application/json','cookie':MNIT_COOKIE,'mauthtoken':MNIT_TOKEN,'user-agent':MY_UA}
-                        try:
-                            api_url = "https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/number"
-                            res = curl_req.post(api_url, headers=h, json={"range": target_range}, impersonate="chrome", timeout=20)
-                            if res.status_code == 200:
-                                nomor_hasil = res.json().get('data', {}).get('copy')
-                        except: pass
-
-                # --- HASIL AKHIR ---
                 if nomor_hasil:
+                    # Notif Telegram Tahap 1
+                    txt_start = (f"📞 <b>BERHASIL AMBIL NOMOR!</b>\n\n👤 <b>Nama :</b> {m_name}\n"
+                                 f"📱 <b>Nomor :</b> <code>{nomor_hasil}</code>\n📌 <b>Situs :</b> {situs}\n"
+                                 f"🌍 <b>Negara :</b> {item.get('serviceName') or item.get('name')}\n💬 <b>Pesan :</b> menunggu sms . . .")
+                    tele_id = send_or_edit_tele(txt_start)
+
                     data_final = {
-                        "number": str(nomor_hasil),
-                        "name": nama_layanan,
-                        "timestamp": int(time.time() * 1000)
+                        "number": str(nomor_hasil), "name": m_name, "country": item.get('serviceName') or item.get('name'),
+                        "situs": situs, "tele_msg_id": tele_id, "timestamp": int(time.time() * 1000)
                     }
-                    # Simpan ke folder dashboard anggota (Web pasti nambah)
+                    # Simpan ke web anggota
                     clean_num = str(nomor_hasil).replace('+', '').strip()
                     requests.patch(f"{FIREBASE_URL}/members/{m_id}/active_numbers/{clean_num}.json", json=data_final)
-                    
-                    # Notif Telegram
-                    kirim_tele(f"✅ <b>NOMOR DIDAPAT!</b>\n👤 Anggota: <b>{m_name}</b>\n📱 Nomor: <code>{nomor_hasil}</code>\n📦 Layanan: {nama_layanan}")
-                    print(f"✅ SUKSES: {nomor_hasil} dikirim ke {m_name}")
-                else:
-                    kirim_tele(f"⚠️ <b>STOK HABIS!</b>\nLayanan: {nama_layanan}\nAnggota: {m_name}")
-                    print(f"❌ GAGAL: Tidak ada stok atau prefix valid untuk {inv_id}")
+                    # Simpan lookup buat Grabber SMS
+                    requests.patch(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json", json=data_final)
 
-                # HAPUS ANTRIAN BIAR WEB BERHENTI MUTER
                 requests.delete(f"{FIREBASE_URL}/perintah_bot/{cmd_id}.json")
-            
             time.sleep(1)
         except Exception as e:
-            print(f"MANAGER ERROR: {e}")
+            print(f"Manager Error: {e}")
             time.sleep(5)
 
+# ==========================================
+# 2. GRABBER: PROSES SMS & EDIT NOTIF TELE
+# ==========================================
+def process_incoming_sms(num, msg):
+    try:
+        clean_num = str(num).replace('+','').strip()
+        owner = requests.get(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json").json()
+        if owner:
+            # Format OTP (Cari angka 4-8 digit)
+            otp_match = re.search(r'\d{4,8}', msg)
+            clean_msg = msg
+            if otp_match:
+                otp = otp_match.group(0)
+                clean_msg = msg.replace(otp, f"<code>{otp}</code>")
+
+            # Update Notif Telegram Lama (Diedit otomatis)
+            txt_sms = (f"📩 <b>SMS MASUK!</b>\n\n👤 <b>Nama :</b> {owner['name']}\n"
+                       f"📱 <b>Nomor :</b> <code>{num}</code>\n📌 <b>Situs :</b> {owner['situs']}\n"
+                       f"🌍 <b>Negara :</b> {owner['country']}\n💬 <b>Pesan :</b> {clean_msg}")
+            send_or_edit_tele(txt_sms, owner.get('tele_msg_id'))
+            
+            # Masukin ke Firebase /messages biar web anggota update
+            requests.post(f"{FIREBASE_URL}/messages.json", json={"liveSms": num, "messageContent": msg, "timestamp": int(time.time()*1000)})
+            # Hapus lookup biar gak dobel notif
+            requests.delete(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json")
+            print(f"✅ SMS Masuk & Notif Updated: {num}")
+    except: pass
+
+def run_grabber():
+    print("📡 SMS Grabber Aktif (Dual Mode)...")
+    done_ids = []
+    while True:
+        try:
+            # --- GRAB CALLTIME ---
+            res_ct = requests.get(f"https://www.calltimepanel.com/yeni/SMS/?_={int(time.time()*1000)}", headers={'Cookie': MY_COOKIE}, timeout=15)
+            soup = BeautifulSoup(res_ct.text, 'html.parser')
+            for r in soup.select('table tr'):
+                tds = r.find_all('td')
+                if len(tds) < 4: continue
+                n, m = tds[1].text.strip().split('-')[-1].strip(), tds[2].text.strip()
+                if f"{n}_{m[:5]}" not in done_ids:
+                    process_incoming_sms(n, m); done_ids.append(f"{n}_{m[:5]}")
+
+            # --- GRAB X-MNIT (Tgl hari ini & kemarin) ---
+            for tgl in [time.strftime("%Y-%m-%d"), time.strftime("%Y-%m-%d", time.localtime(time.time()-86400))]:
+                api_info = f"https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/info?date={tgl}&page=1&search=&status="
+                res_mn = curl_req.get(api_info, headers={'cookie':MNIT_COOKIE,'mauthtoken':MNIT_TOKEN,'user-agent':MY_UA}, impersonate="chrome", timeout=15)
+                if res_mn.status_code == 200:
+                    for it in res_mn.json().get('data', {}).get('data', []):
+                        n, c = it.get('copy'), it.get('code')
+                        if n and c:
+                            clean_c = re.sub('<[^<]+?>', '', str(c)).strip()
+                            if f"{n}_{clean_c}" not in done_ids:
+                                process_incoming_sms(n, f"Your code is {clean_c}"); done_ids.append(f"{n}_{clean_c}")
+            
+            if len(done_ids) > 200: done_ids = done_ids[-100:]
+            time.sleep(3)
+        except: time.sleep(5)
+
 if __name__ == "__main__":
-    t1 = threading.Thread(target=run_manager, daemon=True)
-    t1.start()
-    print("🚀 BOT RUNNING - SEMOGA KALI INI SINKRON!")
+    send_or_edit_tele("🚀 <b>BOT ENGINE V-FINAL ONLINE!</b>\nSemua panel terhubung. PC boleh dimatikan.")
+    threading.Thread(target=run_manager, daemon=True).start()
+    threading.Thread(target=run_grabber, daemon=True).start()
     while True: time.sleep(10)
