@@ -2,7 +2,7 @@ import threading, time, os, re, random, requests, json
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_req
 
-# === CONFIG ===
+# === CONFIGURATION ===
 FIREBASE_URL = os.getenv("FIREBASE_URL", "").strip().rstrip('/')
 MY_COOKIE = os.getenv("MY_COOKIE", "").strip()
 MNIT_COOKIE = os.getenv("MNIT_COOKIE", "").strip()
@@ -11,26 +11,21 @@ MY_UA = os.getenv("MY_UA", "").strip()
 TELE_TOKEN = os.getenv("TELE_TOKEN", "").strip()
 TELE_CHAT_ID = os.getenv("TELE_CHAT_ID", "").strip()
 
-# Cegah dobel proses
-sudah_diproses = set()
-
-def send_or_edit_tele(text, msg_id=None):
-    if not TELE_TOKEN or not TELE_CHAT_ID: return None
+def send_tele(text):
+    if not TELE_TOKEN or not TELE_CHAT_ID: return
     try:
-        url = f"https://api.telegram.org/bot{TELE_TOKEN}/{'editMessageText' if msg_id else 'sendMessage'}"
-        payload = {'chat_id': TELE_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
-        if msg_id: payload['message_id'] = msg_id
-        res = requests.post(url, data=payload, timeout=10).json()
-        return res.get('result', {}).get('message_id')
-    except: return None
+        url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+        requests.post(url, data={'chat_id': TELE_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}, timeout=10)
+    except: pass
 
 # ==========================================
-# 1. MANAGER: AMBIL NOMOR (ANTI-DOBEL)
+# 1. MANAGER: AMBIL NOMOR (ANTI-NYANGKUT)
 # ==========================================
 def run_manager():
-    print("🚀 MANAGER: Antrian Online...")
+    print("🚀 MANAGER: Antrian System Running...")
     while True:
         try:
+            # Ambil antrian
             r = requests.get(f"{FIREBASE_URL}/perintah_bot.json")
             cmds = r.json()
             if not cmds or not isinstance(cmds, dict):
@@ -38,14 +33,11 @@ def run_manager():
             
             inv = requests.get(f"{FIREBASE_URL}/inventory.json").json()
             for cmd_id, val in cmds.items():
-                if cmd_id in sudah_diproses: continue
-                sudah_diproses.add(cmd_id)
-                
-                # Hapus perintah duluan biar gak dobel ambil
+                # Langsung hapus biar bisa klik lagi
                 requests.delete(f"{FIREBASE_URL}/perintah_bot/{cmd_id}.json")
                 
-                m_id = val.get('memberId', 'Unknown')
-                m_name = val.get('memberName', 'Tester')
+                m_id = val.get('memberId', 'tester')
+                m_name = val.get('memberName', 'User')
                 inv_id = val.get('inventoryId')
                 
                 item = inv.get(inv_id) if inv else None
@@ -54,6 +46,7 @@ def run_manager():
                 nomor_hasil = None
                 situs = "CallTime" if "PREFIX" not in str(item.get('type')).upper() else "x.mnitnetwork"
                 
+                # LOGIKA AMBIL STOK
                 if situs == "CallTime":
                     nums = item.get('stock') or item.get('stok') or []
                     if nums and len(nums) > 0:
@@ -67,105 +60,96 @@ def run_manager():
                         nomor_hasil = res.json().get('data', {}).get('copy')
 
                 if nomor_hasil:
-                    # Bersihkan nomor (angka doang)
                     clean_n = re.sub(r'\D', '', str(nomor_hasil))
-                    txt_start = (f"📞 <b>BERHASIL AMBIL NOMOR!</b>\n\n👤 <b>Nama :</b> {m_name}\n"
-                                 f"📱 <b>Nomor :</b> <code>{nomor_hasil}</code>\n📌 <b>Situs :</b> {situs}\n"
-                                 f"🌍 <b>Negara :</b> {item.get('serviceName') or item.get('name')}\n💬 <b>Pesan :</b> menunggu sms . . .")
-                    tele_id = send_or_edit_tele(txt_start)
-
                     data_final = {
                         "number": str(nomor_hasil), "name": m_name, "country": item.get('serviceName') or item.get('name'),
-                        "situs": situs, "tele_msg_id": tele_id, "timestamp": int(time.time() * 1000)
+                        "situs": situs, "timestamp": int(time.time() * 1000)
                     }
+                    # Push ke dashboard web anggota
                     requests.patch(f"{FIREBASE_URL}/members/{m_id}/active_numbers/{clean_n}.json", json=data_final)
+                    # Simpan titipan untuk Grabber SMS (Lookup)
                     requests.patch(f"{FIREBASE_URL}/active_numbers_lookup/{clean_n}.json", json=data_final)
-            
-            if len(sudah_diproses) > 100: sudah_diproses.clear()
+                    
+                    send_tele(f"✅ <b>NOMOR DIDAPAT!</b>\n👤 Nama : {m_name}\n📱 Nomor : <code>{nomor_hasil}</code>\n🌍 Negara : {data_final['country']}\n💬 Pesan : menunggu sms . . .")
             time.sleep(1)
         except: time.sleep(5)
 
 # ==========================================
-# 2. GRABBER: SMS (BONGKAR PAKSA JSON MNIT)
+# 2. GRABBER: SMS (BONGKAR PAKSA X-MNIT)
 # ==========================================
-def process_incoming_sms(num, msg):
+def process_sms(num, msg):
     try:
         clean_num = re.sub(r'\D', '', str(num))
         owner = requests.get(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json").json()
         if owner:
-            # Cari OTP di dalam pesan
-            otp = re.search(r'\d{4,8}', msg)
-            clean_msg = msg.replace(otp.group(0), f"<code>{otp.group(0)}</code>") if otp else msg
-
-            txt_sms = (f"📩 <b>SMS MASUK!</b>\n\n👤 <b>Nama :</b> {owner['name']}\n"
-                       f"📱 <b>Nomor :</b> <code>{owner['number']}</code>\n📌 <b>Situs :</b> {owner['situs']}\n"
-                       f"🌍 <b>Negara :</b> {owner['country']}\n💬 <b>Pesan :</b> {clean_msg}")
+            m_name = owner.get('name', 'User')
+            c_name = owner.get('country', 'Unknown')
+            # Hilangkan tag HTML jika ada di kode
+            clean_code = re.sub('<[^<]+?>', '', str(msg)).replace("Your code is ", "").strip()
             
-            send_or_edit_tele(txt_sms, owner.get('tele_msg_id'))
+            # Format pesan final
+            text = (f"📩 <b>SMS BARU!</b>\n\n"
+                    f"👤 Nama : {m_name}\n"
+                    f"📱 Nomor : <code>{owner['number']}</code>\n"
+                    f"🌍 Negara : {c_name}\n"
+                    f"💬 Pesan : <code>{clean_code}</code>")
+            
+            send_tele(text)
+            # Masukin ke Firebase /messages biar Web Update
             requests.post(f"{FIREBASE_URL}/messages.json", json={"liveSms": owner['number'], "messageContent": msg, "timestamp": int(time.time() * 1000)})
+            # Hapus lookup biar gak dobel grab
             requests.delete(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json")
-            print(f"✅ SMS Masuk: {clean_num}")
+            print(f"✅ OTP GRABBED: {clean_num}")
     except: pass
 
 def run_grabber():
     print("📡 GRABBER: Scanning OTP...")
     done_ids = []
-    # Header diperkuat biar gak dianggap bot
     headers_mnit = {
-        'cookie': MNIT_COOKIE,
-        'mauthtoken': MNIT_TOKEN,
-        'user-agent': MY_UA,
-        'accept': 'application/json, text/plain, */*',
-        'referer': 'https://x.mnitnetwork.com/mdashboard/getnum',
-        'x-requested-with': 'XMLHttpRequest'
+        'cookie': MNIT_COOKIE, 'mauthtoken': MNIT_TOKEN, 'user-agent': MY_UA,
+        'accept': 'application/json', 'x-requested-with': 'XMLHttpRequest'
     }
     
     while True:
         try:
-            # --- GRAB CALLTIME ---
+            # --- SCAN CALLTIME ---
             res_ct = requests.get(f"https://www.calltimepanel.com/yeni/SMS/?_={int(time.time()*1000)}", headers={'Cookie': MY_COOKIE}, timeout=15)
             soup = BeautifulSoup(res_ct.text, 'html.parser')
             for r in soup.select('table tr'):
                 tds = r.find_all('td')
                 if len(tds) < 4: continue
                 n, m = tds[1].text.strip().split('-')[-1].strip(), tds[2].text.strip()
-                if f"{n}_{m[:5]}" not in done_ids:
-                    process_incoming_sms(n, m); done_ids.append(f"{n}_{m[:5]}")
+                if f"{n}_{m[:10]}" not in done_ids:
+                    process_sms(n, m)
+                    done_ids.append(f"{n}_{m[:10]}")
 
-            # --- GRAB X-MNIT (LOGIKA BONGKAR PAKSA) ---
+            # --- SCAN X-MNIT (LOGIKA DOUBLE DATA) ---
             tgl = time.strftime("%Y-%m-%d")
             url_mn = f"https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/info?date={tgl}&page=1&search=&status="
             res_mn = curl_req.get(url_mn, headers=headers_mnit, impersonate="chrome", timeout=15)
             
             if res_mn.status_code == 200:
                 json_data = res_mn.json()
-                # Coba cari data di semua kemungkinan folder MNIT
-                items = []
-                if isinstance(json_data.get('data'), list): 
-                    items = json_data['data']
-                elif isinstance(json_data.get('data'), dict) and isinstance(json_data['data'].get('data'), list):
-                    items = json_data['data']['data']
+                # BONGKAR DATA MNIT
+                items = json_data.get('data', [])
+                if isinstance(items, dict): items = items.get('data', [])
 
                 for it in items:
-                    # Ambil nomor dan kode dengan berbagai kemungkinan nama field
-                    num = it.get('copy') or it.get('number') or it.get('phone')
-                    code = it.get('code') or it.get('otp') or it.get('sms')
-                    
+                    num, code = it.get('copy'), it.get('code')
                     if num and code:
+                        # Bersihkan tag HTML ijo di kode
                         clean_c = re.sub('<[^<]+?>', '', str(code)).strip()
                         uid = f"{num}_{clean_c}"
                         if uid not in done_ids:
-                            print(f"🔥 MNIT Dapet OTP: {num} -> {clean_c}")
-                            process_incoming_sms(num, f"Your code is {clean_c}")
+                            process_sms(num, f"Your code is {clean_c}")
                             done_ids.append(uid)
             
-            if len(done_ids) > 200: done_ids = done_ids[-100:]
+            if len(done_ids) > 500: done_ids = done_ids[-200:]
             time.sleep(3)
-        except Exception as e:
-            print(f"Grabber Error: {e}"); time.sleep(5)
+        except: time.sleep(5)
 
 if __name__ == "__main__":
-    send_or_edit_tele("🚀 <b>BOT ENGINE V-ULTIMATE ONLINE!</b>\nSistem sinkron 24 jam. Selamat bekerja team!")
+    send_tele("🚀 <b>BOT ENGINE V-FINAL AKTIF!</b>\nSemua panel standby. Silakan kerja.")
     threading.Thread(target=run_manager, daemon=True).start()
     threading.Thread(target=run_grabber, daemon=True).start()
     while True: time.sleep(10)
