@@ -15,26 +15,32 @@ TELE_CHAT_ID = os.getenv("TELE_CHAT_ID", "").strip()
 sudah_diproses = set()
 
 def send_tele(text, msg_id=None):
+    """Fungsi kirim notif: Coba Edit, kalau gagal Kirim Baru"""
     if not TELE_TOKEN or not TELE_CHAT_ID: return None
     try:
-        # Coba Edit Pesan Lama Dulu
+        # 1. Coba Edit Pesan Lama
         if msg_id:
             url_edit = f"https://api.telegram.org/bot{TELE_TOKEN}/editMessageText"
             payload = {'chat_id': TELE_CHAT_ID, 'message_id': msg_id, 'text': text, 'parse_mode': 'HTML'}
             res = requests.post(url_edit, data=payload, timeout=10).json()
-            if res.get('ok'): return msg_id
+            if res.get('ok'):
+                print(f"✅ Berhasil Edit Pesan: {msg_id}")
+                return msg_id
         
-        # Kalau Edit Gagal atau Memang Pesan Baru, Kirim Baru
+        # 2. Kalau Gagal Edit atau Pesan Baru, Kirim Baru
         url_send = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
         payload = {'chat_id': TELE_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
         res = requests.post(url_send, data=payload, timeout=10).json()
-        return res.get('result', {}).get('message_id')
+        if res.get('ok'):
+            new_id = res.get('result', {}).get('message_id')
+            print(f"✅ Berhasil Kirim Pesan Baru: {new_id}")
+            return new_id
     except Exception as e:
-        print(f"Gagal Tele: {e}")
+        print(f"❌ Error Tele: {e}")
         return None
 
 # ==========================================
-# 1. MANAGER: PENGAMBIL NOMOR
+# 1. MANAGER: AMBIL NOMOR
 # ==========================================
 def run_manager():
     print("🚀 MANAGER: Antrian Active...")
@@ -70,30 +76,44 @@ def run_manager():
                     if res.status_code == 200: nomor_hasil = res.json().get('data', {}).get('copy')
 
                 if nomor_hasil:
+                    # Kunci Pencocokan: Hanya Angka
                     clean_n = re.sub(r'\D', '', str(nomor_hasil))
-                    txt_start = (f"📞 <b>BERHASIL AMBIL NOMOR!</b>\n\n👤 <b>Nama :</b> {m_name}\n"
-                                 f"📱 <b>Nomor :</b> <code>{nomor_hasil}</code>\n📌 <b>Situs :</b> {situs}\n"
-                                 f"🌍 <b>Negara :</b> {item.get('serviceName') or item.get('name')}\n💬 <b>Pesan :</b> menunggu sms . . .")
+                    
+                    txt_start = (f"📞 <b>BERHASIL AMBIL NOMOR!</b>\n\n"
+                                 f"👤 <b>Nama :</b> {m_name}\n"
+                                 f"📱 <b>Nomor :</b> <code>{nomor_hasil}</code>\n"
+                                 f"📌 <b>Situs :</b> {situs}\n"
+                                 f"🌍 <b>Negara :</b> {item.get('serviceName') or item.get('name')}\n"
+                                 f"💬 <b>Pesan :</b> menunggu sms . . .")
+                    
                     tele_id = send_tele(txt_start)
 
-                    data_final = {"number": str(nomor_hasil), "name": m_name, "country": item.get('serviceName') or item.get('name'), "situs": situs, "tele_msg_id": tele_id, "timestamp": int(time.time() * 1000)}
+                    data_final = {
+                        "number": str(nomor_hasil), "name": m_name, "country": item.get('serviceName') or item.get('name'),
+                        "situs": situs, "tele_msg_id": tele_id, "timestamp": int(time.time() * 1000)
+                    }
                     requests.patch(f"{FIREBASE_URL}/members/{m_id}/active_numbers/{clean_n}.json", json=data_final)
                     requests.patch(f"{FIREBASE_URL}/active_numbers_lookup/{clean_n}.json", json=data_final)
             
             if len(sudah_diproses) > 100: sudah_diproses.clear()
             time.sleep(1)
-        except: time.sleep(5)
+        except Exception as e:
+            print(f"Error Manager: {e}"); time.sleep(5)
 
 # ==========================================
-# 2. GRABBER: SMS (FIX TOTAL)
+# 2. GRABBER: SMS (SINKRONISASI TOTAL)
 # ==========================================
 def process_incoming_sms(num, full_msg):
     try:
+        # Cari pemilik nomor (Hanya Angka)
         clean_num = re.sub(r'\D', '', str(num))
-        # Cari di lookup siapa pemiliknya
-        owner = requests.get(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json").json()
+        print(f"🔍 Mencari data untuk: {clean_num}")
+        
+        r_lookup = requests.get(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json")
+        owner = r_lookup.json()
+        
         if owner:
-            # Ambil angka OTP saja untuk monospaced
+            # Format OTP monospaced
             otp_match = re.search(r'\d{4,8}', full_msg)
             display_msg = full_msg
             if otp_match:
@@ -103,17 +123,27 @@ def process_incoming_sms(num, full_msg):
             text_sms = (f"📩 <b>SMS MASUK!</b>\n\n"
                        f"👤 <b>Nama :</b> {owner['name']}\n"
                        f"📱 <b>Nomor :</b> <code>{owner['number']}</code>\n"
+                       f"📌 <b>Situs :</b> {owner['situs']}\n"
                        f"🌍 <b>Negara :</b> {owner['country']}\n"
                        f"💬 <b>Pesan :</b> {display_msg}")
             
-            # 1. Kirim Notif Telegram (Edit/Send)
+            # Update Telegram (Edit atau Kirim Baru)
             send_tele(text_sms, owner.get('tele_msg_id'))
-            # 2. Update Firebase Web
-            requests.post(f"{FIREBASE_URL}/messages.json", json={"liveSms": owner['number'], "messageContent": full_msg, "timestamp": int(time.time() * 1000)})
-            # 3. Hapus lookup biar gak dobel
+            
+            # Update Firebase Web (liveSms harus sama persis dengan yang ada di list web)
+            requests.post(f"{FIREBASE_URL}/messages.json", json={
+                "liveSms": owner['number'], 
+                "messageContent": full_msg, 
+                "timestamp": int(time.time() * 1000)
+            })
+            
+            # Hapus lookup biar gak dobel notif
             requests.delete(f"{FIREBASE_URL}/active_numbers_lookup/{clean_num}.json")
-            print(f"✅ Notif Telegram Terkirim untuk {clean_num}")
-    except: pass
+            print(f"✅ Notif Sukses Dikirim: {clean_num}")
+        else:
+            print(f"⚠️ Nomor {clean_num} tidak ada pemiliknya di lookup.")
+    except Exception as e:
+        print(f"❌ Gagal Process SMS: {e}")
 
 def run_grabber():
     print("📡 GRABBER: Scanning OTP...")
@@ -132,7 +162,7 @@ def run_grabber():
                 if f"{n}_{m[:5]}" not in done_ids:
                     process_incoming_sms(n, m); done_ids.add(f"{n}_{m[:5]}")
 
-            # --- 2. SCAN X-MNIT (Sesuai Gambar Preview lo) ---
+            # --- 2. SCAN X-MNIT ---
             tgl = time.strftime("%Y-%m-%d")
             url_mn = f"https://x.mnitnetwork.com/mapi/v1/mdashboard/getnum/info?date={tgl}&page=1&search=&status="
             res_mn = curl_req.get(url_mn, headers=h_mnit, impersonate="chrome", timeout=15)
@@ -141,6 +171,7 @@ def run_grabber():
                 items = data_mnit.get('data', {}).get('numbers', [])
                 for it in items:
                     num, otp_raw = it.get('number'), it.get('otp')
+                    # Hanya proses kalau OTP beneran sudah muncul (Bukan "Waiting")
                     if num and otp_raw and "Waiting" not in otp_raw:
                         uid = f"{num}_{otp_raw[:15]}"
                         if uid not in done_ids:
@@ -152,7 +183,7 @@ def run_grabber():
         except: time.sleep(5)
 
 if __name__ == "__main__":
-    send_tele("🚀 <b>BOT ENGINE V-FINAL ONLINE!</b>\nSistem sinkron 24 jam. Selamat bekerja team!")
+    send_tele("🚀 <b>BOT ENGINE V-FINAL ONLINE!</b>\nSemua panel terhubung 24 Jam.")
     threading.Thread(target=run_manager, daemon=True).start()
     threading.Thread(target=run_grabber, daemon=True).start()
     while True: time.sleep(10)
